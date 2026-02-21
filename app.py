@@ -9,21 +9,34 @@ import streamlit as st
 import yfinance as yf
 
 
-# =========================
-# Page setup
-# =========================
+# ==========================================================
+# Thai Short-Term Stock Scanner (single file)
+# - Uses Yahoo Finance via yfinance (free)
+# - Symbols source (recommended): upload CSV/XLSX OR paste symbols
+# - Optional: try fetch from web (may be blocked sometimes)
+# ==========================================================
+
 st.set_page_config(page_title="Thai Short-Term Stock Scanner", layout="wide")
 st.title("Thai Short-Term Stock Scanner (Yahoo Finance - Free)")
+
 st.caption(
-    "สแกนหุ้นไทยโหมดเล่นสั้น: BUY/SELL/WAIT + แผน TP/SL/Trailing ตามเทรนด์ "
-    "(เทรนด์ดี TP10 SL5 | เทรนด์กลาง TP7 SL4 | เทรนด์อ่อน TP5 SL3) | ถึง TP → ขาย 50% แล้ว Trailing ที่เหลือ"
+    "เล่นสั้น: BUY/SELL/WAIT + TP/SL/Trailing ตามเทรนด์ | "
+    "เทรนด์ดี TP10% SL5% (เริ่ม trailing +5%) | "
+    "เทรนด์กลาง TP7% SL4% (เริ่ม trailing +4%) | "
+    "เทรนด์อ่อน TP5% SL3% (เริ่ม trailing +3%) | "
+    "ถึง TP → แนะนำขาย 50% แล้ว Trailing ที่เหลือ"
 )
 
-with st.expander("ข้อจำกัดและวิธีแก้", expanded=False):
-    st.write(
-        "- Yahoo ผ่าน yfinance เป็นข้อมูลฟรี อาจช้า/โดนจำกัดการเรียกเป็นช่วง ๆ\n"
-        "- ถ้าเว็บรายชื่อหุ้นโดนบล็อก ให้ใช้อัปโหลดไฟล์รายชื่อหุ้น (CSV/XLSX) จะเสถียรที่สุด\n"
-        "- ถ้าสแกนแล้วช้า: ลดจำนวนสแกน/ลด validate/เลือก period สั้นลง\n"
+with st.expander("วิธีใช้ (สรุป)", expanded=False):
+    st.markdown(
+        """
+1) **แนะนำที่สุด:** อัปโหลดไฟล์ `symbols.csv` หรือ `symbols.xlsx` ที่มีคอลัมน์ `Symbol` (เช่น PTT, AOT, SCC)
+2) หรือ **วางรายชื่อหุ้น** ในกล่องด้านซ้าย (1 บรรทัดต่อ 1 ตัว)
+3) กด **Run Scan**
+4) ถ้ามีหุ้นในพอร์ต: ใส่พอร์ตในกล่อง `Ticker,Cost,Qty` เช่น `PTT.BK,34.50,1000`
+
+> หมายเหตุ: ถ้าดึงเว็บรายชื่อหุ้นแล้วโดน 403 ให้ใช้อัปโหลด/วางรายชื่อแทน จะไม่โดนบล็อกแน่นอน
+"""
     )
 
 
@@ -52,7 +65,6 @@ def macd(close: pd.Series, fast=12, slow=26, signal=9):
 # Trend + Risk/Reward rules (ตามที่ตกลง)
 # =========================
 def trend_score(last: pd.Series) -> int:
-    # EMA20/EMA50 + Close>EMA20 + RSI>=50 + MACD>Signal
     score = 0
     score += 1 if last["EMA20"] > last["EMA50"] else 0
     score += 1 if last["Close"] > last["EMA20"] else 0
@@ -71,60 +83,21 @@ def rr_by_trend(score: int) -> dict:
 
 
 def trailing_from_peak(entry: float, peak: float, rr: dict):
-    # เริ่ม trailing เมื่อ peak >= entry*(1+trail_start)
     start = entry * (1 + rr["trail_start"])
     if peak < start:
         return None
-    # เลื่อน stop ตาม peak ด้วยระยะ sl%
     return peak * (1 - rr["sl"])
 
 
 # =========================
-# Symbols sources
+# Symbols loaders
 # =========================
-@st.cache_data(ttl=24 * 60 * 60)
-def load_symbols_from_stockanalysis() -> pd.DataFrame:
-    """
-    ดึงรายชื่อหุ้นไทยจาก StockAnalysis แบบกัน 403:
-    ใช้ requests + User-Agent แล้วค่อย feed HTML ให้ pd.read_html
-    """
-    url = "https://stockanalysis.com/list/stock-exchange-of-thailand/"
-    headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                      "AppleWebKit/537.36 (KHTML, like Gecko) "
-                      "Chrome/123.0.0.0 Safari/537.36",
-        "Accept-Language": "en-US,en;q=0.9,th;q=0.8",
-    }
-    r = requests.get(url, headers=headers, timeout=30)
-    r.raise_for_status()
-
-    tables = pd.read_html(StringIO(r.text))
-    df = None
-    for t in tables:
-        cols = [str(c).strip().lower() for c in t.columns]
-        if "symbol" in cols:
-            df = t.copy()
-            break
-    if df is None:
-        raise RuntimeError("ไม่พบตาราง Symbol จาก StockAnalysis")
-
-    sym_col = next((c for c in df.columns if str(c).strip().lower() == "symbol"), df.columns[0])
-    out = pd.DataFrame({"Symbol": df[sym_col].astype(str).str.strip()})
-    out = out[out["Symbol"].str.match(r"^[A-Z0-9\.\-]+$")]
-    out = out.drop_duplicates().reset_index(drop=True)
-    return out
-
-
 def load_symbols_from_upload(uploaded_file) -> pd.DataFrame:
-    """
-    รองรับ CSV/XLSX ที่ผู้ใช้อัปโหลดเอง (เสถียรสุด)
-    ต้องมีคอลัมน์ Symbol หรือ Ticker
-    """
     name = uploaded_file.name.lower()
     if name.endswith(".csv"):
         df = pd.read_csv(uploaded_file)
     elif name.endswith(".xlsx"):
-        df = pd.read_excel(uploaded_file, engine="openpyxl")
+        df = pd.read_excel(uploaded_file)  # openpyxl used automatically on cloud
     else:
         raise RuntimeError("รองรับเฉพาะ .csv หรือ .xlsx")
 
@@ -145,15 +118,59 @@ def load_symbols_from_upload(uploaded_file) -> pd.DataFrame:
     return out
 
 
+def load_symbols_from_paste(text: str) -> pd.DataFrame:
+    lines = []
+    for line in (text or "").splitlines():
+        s = line.strip().upper()
+        if not s or s.startswith("#"):
+            continue
+        # allow "PTT", or "PTT.BK" (we'll normalize later)
+        s = s.replace(" ", "")
+        lines.append(s)
+    if not lines:
+        return pd.DataFrame(columns=["Symbol"])
+    df = pd.DataFrame({"Symbol": lines})
+    df["Symbol"] = df["Symbol"].str.replace(".BK", "", regex=False)
+    df = df[df["Symbol"].str.match(r"^[A-Z0-9\.\-]+$")]
+    return df.drop_duplicates().reset_index(drop=True)
+
+
+@st.cache_data(ttl=24 * 60 * 60)
+def load_symbols_from_web_stockanalysis() -> pd.DataFrame:
+    """
+    Optional web fetch (may be blocked by 403 on some networks).
+    Uses requests+UA then pd.read_html(StringIO(html)) — NOT pd.read_html(url).
+    """
+    url = "https://stockanalysis.com/list/stock-exchange-of-thailand/"
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                      "AppleWebKit/537.36 (KHTML, like Gecko) "
+                      "Chrome/123.0.0.0 Safari/537.36",
+        "Accept-Language": "en-US,en;q=0.9,th;q=0.8",
+    }
+    r = requests.get(url, headers=headers, timeout=30)
+    r.raise_for_status()
+    tables = pd.read_html(StringIO(r.text))
+    df = None
+    for t in tables:
+        cols = [str(c).strip().lower() for c in t.columns]
+        if "symbol" in cols:
+            df = t.copy()
+            break
+    if df is None:
+        raise RuntimeError("ไม่พบตาราง Symbol จากเว็บ")
+    sym_col = next((c for c in df.columns if str(c).strip().lower() == "symbol"), df.columns[0])
+    out = pd.DataFrame({"Symbol": df[sym_col].astype(str).str.strip()})
+    out = out[out["Symbol"].str.match(r"^[A-Z0-9\.\-]+$")]
+    out = out.drop_duplicates().reset_index(drop=True)
+    return out
+
+
 # =========================
-# Validate Yahoo (.BK) + scanning
+# Yahoo validation + scanning
 # =========================
 @st.cache_data(ttl=24 * 60 * 60)
 def validate_yahoo_symbols(symbols: list[str], max_check: int = 250) -> list[str]:
-    """
-    ตรวจว่าดึงราคาได้จริงใน Yahoo: symbol -> symbol.BK
-    ทำเบา ๆ เพื่อลดโอกาสโดนจำกัด
-    """
     ok = []
     for s in symbols[:max_check]:
         t = f"{s}.BK"
@@ -168,10 +185,6 @@ def validate_yahoo_symbols(symbols: list[str], max_check: int = 250) -> list[str
 
 
 def compute_signal_short(df: pd.DataFrame) -> dict:
-    """
-    คำนวณสัญญาณ + โซนเทรนด์ + TP/SL/TrailingStart
-    ใช้ OHLCV (yfinance) ใน df columns: Open High Low Close Volume
-    """
     df = df.dropna().copy()
     if len(df) < 80:
         raise ValueError("Not enough data")
@@ -185,7 +198,6 @@ def compute_signal_short(df: pd.DataFrame) -> dict:
     last = df.iloc[-1]
     prev = df.iloc[-2] if len(df) >= 2 else last
 
-    # --- Signal scoring for short ---
     trend_up = (last["EMA20"] > last["EMA50"]) and (last["Close"] > last["EMA20"])
     macd_up = (prev["MACD"] <= prev["MACDsig"]) and (last["MACD"] > last["MACDsig"])
     macd_down = (prev["MACD"] >= prev["MACDsig"]) and (last["MACD"] < last["MACDsig"])
@@ -208,10 +220,8 @@ def compute_signal_short(df: pd.DataFrame) -> dict:
         action = "WAIT"
         reason = "No clear edge"
 
-    # --- Trend zone for TP/SL ---
     tscore = trend_score(last)
     rr = rr_by_trend(tscore)
-
     peak60 = float(close.tail(60).max())
 
     return {
@@ -234,9 +244,6 @@ def compute_signal_short(df: pd.DataFrame) -> dict:
 
 
 def parse_portfolio(text: str) -> pd.DataFrame:
-    """
-    บรรทัดละตัว: Ticker,Cost,Qty  (Ticker แบบ PTT.BK)
-    """
     rows = []
     for line in (text or "").splitlines():
         line = line.strip()
@@ -245,7 +252,9 @@ def parse_portfolio(text: str) -> pd.DataFrame:
         parts = [p.strip() for p in line.split(",")]
         if len(parts) < 2:
             continue
-        t = parts[0]
+        t = parts[0].strip().upper()
+        if not t.endswith(".BK"):
+            t = t + ".BK"
         try:
             cost = float(parts[1])
         except Exception:
@@ -264,59 +273,71 @@ def parse_portfolio(text: str) -> pd.DataFrame:
 # Sidebar UI
 # =========================
 with st.sidebar:
-    st.header("1) เลือกแหล่งรายชื่อหุ้น")
-    st.caption("แนะนำ: อัปโหลด CSV/XLSX (เสถียรกว่าเว็บ) | ต้องมีคอลัมน์ Symbol/Ticker")
-    uploaded = st.file_uploader("อัปโหลดรายชื่อหุ้น (CSV/XLSX)", type=["csv", "xlsx"])
+    st.header("1) รายชื่อหุ้น (Symbols)")
+    st.caption("แนะนำ: อัปโหลดไฟล์ CSV/XLSX (มีคอลัมน์ Symbol) เพื่อเลี่ยง 403")
+    uploaded = st.file_uploader("อัปโหลด symbols.csv / symbols.xlsx", type=["csv", "xlsx"])
+
+    st.caption("หรือวางสัญลักษณ์ 1 บรรทัดต่อ 1 ตัว (เช่น PTT, AOT, SCC)")
+    paste_symbols = st.text_area("Paste symbols", height=140, placeholder="PTT\nAOT\nSCC\nCPALL\nBDMS")
+
+    use_web = st.checkbox("ลองดึงรายชื่อหุ้นจากเว็บ (อาจโดน 403 ได้)", value=False)
 
     st.divider()
-    st.header("2) ตั้งค่าการสแกน")
-    validate_n = st.slider("จำนวนที่จะ validate ว่าดึงจาก Yahoo ได้ (.BK)", 50, 800, 250, 50)
-    scan_n = st.slider("จำนวนหุ้นที่จะสแกนจริง", 20, 500, 120, 10)
+    st.header("2) ตั้งค่าสแกน")
+    validate_n = st.slider("Validate Yahoo (.BK)", 20, 800, 200, 20)
+    scan_n = st.slider("จำนวนหุ้นที่จะสแกนจริง", 10, 500, 100, 10)
     period = st.selectbox("ช่วงข้อมูลที่ใช้คำนวณ", ["6mo", "1y", "2y"], index=1)
 
     st.divider()
     st.header("3) My Portfolio (optional)")
     st.caption("บรรทัดละตัว: Ticker,Cost,Qty  (Ticker แบบ PTT.BK)")
-    portfolio_text = st.text_area("ตัวอย่าง:\nPTT.BK,34.50,1000\nAOT.BK,62.00,200", height=120)
+    portfolio_text = st.text_area("Portfolio", height=120, placeholder="PTT.BK,34.50,1000\nAOT.BK,62.00,200")
 
     st.divider()
     run = st.button("Run Scan", type="primary")
 
 
 # =========================
-# Run
+# Main
 # =========================
 if run:
-    # 1) Load symbols
-    with st.spinner("กำลังโหลดรายชื่อหุ้น..."):
+    # Load symbols with priority: upload -> paste -> web (optional)
+    with st.spinner("กำลังเตรียมรายชื่อหุ้น..."):
+        sym_df = pd.DataFrame(columns=["Symbol"])
+        source = ""
+
         if uploaded is not None:
             sym_df = load_symbols_from_upload(uploaded)
-            source_msg = f"ใช้รายชื่อจากไฟล์อัปโหลด ({len(sym_df):,} symbols)"
-        else:
+            source = f"ไฟล์อัปโหลด ({len(sym_df):,} symbols)"
+        elif paste_symbols.strip():
+            sym_df = load_symbols_from_paste(paste_symbols)
+            source = f"ข้อความที่วาง ({len(sym_df):,} symbols)"
+        elif use_web:
             try:
-                sym_df = load_symbols_from_stockanalysis()
-                source_msg = f"ใช้รายชื่อจากเว็บ StockAnalysis ({len(sym_df):,} symbols)"
-            except Exception:
-                st.error("ดึงรายชื่อหุ้นจากเว็บไม่สำเร็จ → แนะนำให้อัปโหลดไฟล์ CSV/XLSX รายชื่อหุ้นแทน")
+                sym_df = load_symbols_from_web_stockanalysis()
+                source = f"เว็บ StockAnalysis ({len(sym_df):,} symbols)"
+            except Exception as e:
+                st.error("ดึงรายชื่อจากเว็บไม่สำเร็จ (มักเป็น 403) → แนะนำให้อัปโหลด/วางรายชื่อแทน")
                 st.stop()
+        else:
+            st.error("ยังไม่มีรายชื่อหุ้น: กรุณาอัปโหลดไฟล์ หรือวางรายชื่อหุ้นในช่อง Paste symbols")
+            st.stop()
 
-    st.success(source_msg)
+    st.success(f"แหล่งรายชื่อหุ้น: {source}")
 
-    base_symbols = sym_df["Symbol"].tolist()
+    base_symbols = sym_df["Symbol"].astype(str).str.upper().str.replace(".BK", "", regex=False).tolist()
 
-    # 2) Validate yfinance availability
     with st.spinner("กำลัง validate ว่าหุ้นมีข้อมูลใน Yahoo (.BK) ..."):
         ok_tickers = validate_yahoo_symbols(base_symbols, max_check=validate_n)
 
     st.write(f"ผ่าน validate: **{len(ok_tickers):,}** ตัว | จะสแกน: **{min(scan_n, len(ok_tickers)):,}** ตัว")
 
     if len(ok_tickers) == 0:
-        st.error("ไม่ผ่าน validate เลย (อาจโดนจำกัดจาก Yahoo) → ลด validate_n หรือเปลี่ยนเน็ต/ลองใหม่")
+        st.error("ไม่ผ่าน validate เลย → ลด validate_n / ลองใหม่ / เปลี่ยนเน็ต หรือใช้รายชื่อหุ้นที่แน่ใจว่ามีใน Yahoo")
         st.stop()
 
     tickers = ok_tickers[:scan_n]
 
-    # 3) Download & compute
     results = []
     chunk_size = 80
     total_chunks = max(1, (len(tickers) + chunk_size - 1) // chunk_size)
@@ -367,28 +388,24 @@ if run:
         st.error("สแกนไม่สำเร็จ (อาจโดน rate limit) → ลด scan_n / ลด validate_n / ใช้ period สั้นลง")
         st.stop()
 
-    # Ranking: BUY first then score high
+    # Ranking
     order_map = {"BUY": 0, "WAIT": 1, "SELL": 2}
     out["Order"] = out["Action"].map(order_map).fillna(9).astype(int)
     out = out.sort_values(["Order", "Score"], ascending=[True, False]).drop(columns=["Order"])
 
-    # =========================
-    # No Position advice
-    # =========================
+    # No position advice
     st.subheader("คำแนะนำกรณี 'ไม่มีของ' (No Position)")
     c1, c2, c3 = st.columns(3)
     c1.metric("BUY", int((out["Action"] == "BUY").sum()))
     c2.metric("WAIT", int((out["Action"] == "WAIT").sum()))
     c3.metric("SELL", int((out["Action"] == "SELL").sum()))
     st.write(
-        "- ถ้า **BUY น้อย/ไม่มี**: ไม่ต้องฝืนเทรด → เก็บ Watchlist จาก WAIT ที่คะแนนสูง ๆ แล้วรอให้เป็น BUY\n"
+        "- ถ้า **BUY น้อย/ไม่มี**: ไม่ต้องฝืนเทรด → เก็บ Watchlist จาก WAIT ที่คะแนนสูง ๆ แล้วรอ\n"
         "- ถ้า **BUY มี**: เข้าได้ตามระบบ พร้อม TP/SL ตาม TrendZone\n"
         "- ถ้า **SELL**: ไม่เข้า รอจนกลับเป็น BUY"
     )
 
-    # =========================
     # Tables
-    # =========================
     colA, colB = st.columns(2)
     with colA:
         st.subheader("Top BUY")
@@ -397,12 +414,10 @@ if run:
         st.subheader("Top SELL / ระวัง")
         st.dataframe(out[out["Action"] == "SELL"].head(30), use_container_width=True)
 
-    st.subheader("ทั้งหมด (ค้นหา/กรองได้)")
+    st.subheader("ทั้งหมด")
     st.dataframe(out, use_container_width=True)
 
-    # =========================
     # Portfolio advice
-    # =========================
     port = parse_portfolio(portfolio_text)
     if len(port) > 0:
         st.subheader("คำแนะนำสำหรับ 'ของที่ถืออยู่' (เล่นสั้น)")
@@ -418,7 +433,7 @@ if run:
                 rows.append({
                     "Ticker": t, "Cost": cost, "Qty": qty,
                     "Status": "ไม่พบในผลสแกน",
-                    "Suggestion": "เพิ่ม scan_n หรือเช็ค ticker ต้องลงท้าย .BK",
+                    "Suggestion": "เพิ่ม scan_n/validate_n หรือเช็คว่า ticker ถูกต้อง (.BK)"
                 })
                 continue
 
@@ -435,7 +450,6 @@ if run:
             trail_price = trailing_from_peak(cost, peak, rr)
             sig_now = str(r.get("Action", "WAIT"))
 
-            # decision engine ตามที่คุย
             if cur <= sl_price:
                 status = "HIT SL"
                 sug = "ถึงจุดตัดขาดทุน → แนะนำ CUT"
@@ -456,7 +470,7 @@ if run:
                     sug = "ยังไม่ถึง SL → ถือรอตามระบบ (ห้ามเฉลี่ยลงจนกว่าจะกลับเป็น BUY ชัดเจน)"
                 elif pnl >= 0 and sig_now == "SELL":
                     status = "PROFIT + SELL"
-                    sug = "กำไรอยู่แต่สัญญาณ SELL → แนะนำล็อกกำไร/ทยอยปิด (อย่างน้อย 50%)"
+                    sug = "กำไรอยู่แต่ SELL → แนะนำล็อกกำไร/ทยอยปิด (อย่างน้อย 50%)"
                 else:
                     status = "PROFIT"
                     sug = "กำไรอยู่ → ถือและเลื่อน stop ตาม / รอถึง TP หรือ trailing"
@@ -481,9 +495,19 @@ if run:
     st.divider()
     st.markdown(
         """
-### Deploy บน Streamlit Cloud (สั้น ๆ)
-1) Push `app.py` + `requirements.txt` ขึ้น GitHub  
-2) ไปที่ Streamlit Community Cloud → New app → เลือก repo → เลือก `app.py` → Deploy  
-3) แก้โค้ดใน GitHub แล้ว commit → ระบบ redeploy อัตโนมัติ
+### Deploy (GitHub → Streamlit Cloud)
+- ใส่ไฟล์ `app.py` นี้ + `requirements.txt` (ดูด้านล่าง)
+- Streamlit Cloud → New app → เลือก repo → เลือก `app.py` → Deploy
+
+### requirements.txt
+```
+streamlit
+yfinance
+pandas
+numpy
+requests
+lxml
+openpyxl
+```
 """
     )
